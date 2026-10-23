@@ -20,6 +20,7 @@ import {
   ConverseStreamCommand,
   CountTokensCommand,
   type ConverseStreamCommandInput,
+  type OutputConfig,
   type ConverseStreamMetadataEvent as BedrockConverseStreamMetadataEvent,
   type ConverseStreamOutput,
   type InferenceConfiguration,
@@ -60,7 +61,7 @@ import {
   resolveConfigMetadata,
 } from '../models/model.js'
 import { THINKING_BINDING_BETA, isThinkingBindingError, thinkingWithDropBlock } from './thinking-binding.js'
-import type { ContentBlock, Message, StopReason, ToolUseBlock } from '../types/messages.js'
+import type { ContentBlock, Message, ReasoningBlock, StopReason, ToolUseBlock } from '../types/messages.js'
 import type { AudioSource, ImageSource, VideoSource, DocumentSource } from '../types/media.js'
 import type { CitationsDelta, ModelStreamEvent, ReasoningContentDelta, Usage } from '../models/streaming.js'
 import type { Citation, CitationLocation, CitationsBlockData } from '../types/citations.js'
@@ -71,6 +72,15 @@ import { logger } from '../logging/logger.js'
 import { warnOnce } from '../logging/warn-once.js'
 import { NOOP_TOOL_SPEC } from '../tools/noop-tool.js'
 import { ensureStrictJsonSchema, findUnsupportedStrictKeywords } from './strict-schema.js'
+import {
+  handleRejectedMechanism,
+  structuredOutputMechanisms,
+  toNativeOutputSchema,
+  type StructuredOutputMechanism,
+} from './native-output.js'
+import { zodSchemaToJsonSchema } from '../tools/zod-utils.js'
+import { STRUCTURED_OUTPUT_TOOL_NAME } from '../tools/structured-output-tool.js'
+import type { z } from 'zod'
 import { MODEL_DEFAULTS, defaultModelWarningMessage } from './defaults.js'
 
 const DEFAULT_BEDROCK_REGION_SUPPORTS_FIP = false
@@ -95,6 +105,28 @@ const MODELS_INCLUDE_STATUS = ['anthropic.claude']
  * @see https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
  */
 const MODELS_SUPPORTING_ANTHROPIC_CACHING = ['anthropic', 'claude']
+
+/**
+ * Models that reject any reasoning text block replayed in history
+ * ("User messages cannot contain reasoning content").
+ */
+const MODELS_REJECT_REASONING_TEXT = [
+  'amazon.nova-lite',
+  'amazon.nova-pro',
+  'google.gemma',
+  'meta.llama',
+  'mistral.devstral',
+  'mistral.ministral',
+  'mistral.mistral-large',
+  'nvidia.nemotron-nano-9b',
+  'nvidia.nemotron-super',
+  'openai.gpt-5',
+  'openai.gpt-6',
+  'qwen.qwen3-235b',
+  'qwen.qwen3-coder',
+  'writer.palmyra',
+  'xai.grok',
+]
 
 /**
  * Error messages that indicate context window overflow.
@@ -704,11 +736,9 @@ export class BedrockModel extends Model<BedrockModelConfig> {
    */
   async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
     try {
-      // Format the request for Bedrock
-      const request = this._formatRequest(messages, options)
       if (this._config.stream !== false) {
         // Create and send the command
-        const response = await this._send(request, (input) => {
+        const response = await this._sendRequest(messages, options, (input) => {
           const command = new ConverseStreamCommand(input)
           return options?.cancelSignal
             ? this._client.send(command, { abortSignal: options.cancelSignal })
@@ -755,7 +785,7 @@ export class BedrockModel extends Model<BedrockModelConfig> {
           }
         }
       } else {
-        const response = await this._send(request, (input) => {
+        const response = await this._sendRequest(messages, options, (input) => {
           const command = new ConverseCommand(input)
           return options?.cancelSignal
             ? this._client.send(command, { abortSignal: options.cancelSignal })
@@ -776,6 +806,71 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       // Re-throw other errors as-is
       throw error
     }
+  }
+
+  /**
+   * Formats and sends the request, with the strongest structured output mechanism the model accepts when the call
+   * must produce a schema.
+   *
+   * Mechanisms the model rejects are remembered for the process, so later requests start at the one that works.
+   * Rejections happen during request validation, before the model generates anything. AnthropicModel follows the
+   * same order but resends through stream(), since its rejection arrives inside the stream.
+   *
+   * @param messages - Conversation messages
+   * @param options - Stream options
+   * @param send - Sends a request to the Converse or ConverseStream API
+   * @returns The API response
+   */
+  private async _sendRequest<T>(
+    messages: Message[],
+    options: StreamOptions | undefined,
+    send: (input: ConverseStreamCommandInput) => Promise<T>
+  ): Promise<T> {
+    const schema = options?.structuredOutputSchema
+    const modelId = this._config.modelId
+    if (!schema || !modelId) {
+      return this._send(this._formatRequest(messages, options), send)
+    }
+
+    const mechanisms = structuredOutputMechanisms('bedrock', modelId, options.toolChoice, schema)
+    for (const mechanism of mechanisms.slice(0, -1)) {
+      try {
+        return await this._send(this._structuredOutputRequest(messages, options, mechanism, schema), send)
+      } catch (error) {
+        if (!recordRejectedMechanism(error, mechanism, modelId, schema)) throw error
+      }
+    }
+    const fallback = mechanisms[mechanisms.length - 1] ?? 'auto'
+    return this._send(this._structuredOutputRequest(messages, options, fallback, schema), send)
+  }
+
+  /**
+   * Formats the request for a structured output mechanism.
+   *
+   * Converse has no tool choice that rules out tool calls, so on native and auto the model may still call another
+   * tool; the agent loop runs it and the retry continues with the same mechanism.
+   *
+   * @param messages - Conversation messages
+   * @param options - Stream options, whose tool choice forces the structured output tool
+   * @param mechanism - The mechanism to enforce structured output with
+   * @param schema - The schema the response must produce
+   * @returns Formatted Bedrock request
+   */
+  private _structuredOutputRequest(
+    messages: Message[],
+    options: StreamOptions,
+    mechanism: StructuredOutputMechanism,
+    schema: z.ZodSchema
+  ): ConverseStreamCommandInput {
+    if (mechanism === 'forced') {
+      return this._formatRequest(messages, options)
+    }
+    // Formatted with auto tool choice, which also keeps the thinking config forcing strips.
+    const request = this._formatRequest(messages, { ...options, toolChoice: { auto: {} } })
+    if (mechanism === 'native') {
+      request.outputConfig = { ...request.outputConfig, ...nativeOutputConfig(schema) }
+    }
+    return request
   }
 
   /**
@@ -970,9 +1065,16 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       ? this._findLastUserTextMessageIndex(messages)
       : undefined
 
+    let droppedReasoningContent = false
+
     const formattedMessages = messages.reduce<BedrockMessage[]>((acc, message, idx) => {
       const shouldApplyGuardBlocks = idx === lastUserTextIdx
       const content = message.content
+        .filter((block: ContentBlock) => {
+          if (block.type !== 'reasoningBlock' || !this._rejectsReasoningBlock(block)) return true
+          droppedReasoningContent = true
+          return false
+        })
         .map((block: ContentBlock) => {
           const formattedBlock = this._formatContentBlock(block)
           return shouldApplyGuardBlocks ? this._applyGuardBlocks(formattedBlock) : formattedBlock
@@ -986,6 +1088,12 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       return acc
     }, [])
 
+    if (droppedReasoningContent) {
+      logger.debug(
+        `model_id=<${this._config.modelId ?? MODEL_DEFAULTS.bedrock.modelId}> | dropped reasoningContent blocks the model does not accept`
+      )
+    }
+
     const cacheConfig = this._config.cacheConfig
     const messagesCache = this._shouldEnableCaching()
       ? resolveCacheSection(cacheConfig?.messagesTTL, cacheConfig?.ttl)
@@ -995,6 +1103,30 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     }
 
     return formattedMessages
+  }
+
+  /**
+   * Whether the configured model would reject this reasoning block if it were replayed.
+   *
+   * Only blocks that are certain to fail are dropped. `signature` is Anthropic-only: Anthropic models reject
+   * reasoning text without one and every other model rejects reasoning text with one. Models in
+   * `MODELS_REJECT_REASONING_TEXT` reject reasoning text outright and DeepSeek rejects any reasoning block.
+   * `redactedContent` is otherwise opaque and kept, as is every block when the model ID is an ARN or bare
+   * inference profile ID that names no vendor.
+   *
+   * @param block - Reasoning block replayed from message history
+   * @returns True if the block must be dropped from the request
+   */
+  private _rejectsReasoningBlock(block: ReasoningBlock): boolean {
+    const modelId = (this._config.modelId ?? MODEL_DEFAULTS.bedrock.modelId).toLowerCase()
+    if (modelId.includes('deepseek')) return true
+    if (block.text === undefined && block.signature === undefined) return false
+
+    const signed = Boolean(block.signature)
+    if (modelId.includes('anthropic') || modelId.includes('claude')) return !signed
+    if (modelId.startsWith('arn:') || !modelId.includes('.')) return false
+    if (MODELS_REJECT_REASONING_TEXT.some((model) => modelId.includes(model))) return true
+    return signed
   }
 
   /**
@@ -2013,7 +2145,9 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     return {
       location: this._mapCitationLocationToBedrock(citation.location),
       sourceContent: citation.sourceContent.map((sc) => ({ text: sc.text })),
-      source: citation.source,
+      // An empty source marks one Bedrock never returned (e.g. document citations), and Bedrock
+      // rejects `source` on those locations while requiring it on search-result locations.
+      ...(citation.source && { source: citation.source }),
       title: citation.title,
     }
   }
@@ -2112,6 +2246,32 @@ export class BedrockModel extends Model<BedrockModelConfig> {
 
     return events
   }
+}
+
+/** Builds the Converse outputConfig that constrains the response to the schema. */
+function nativeOutputConfig(schema: z.ZodSchema): OutputConfig {
+  const nativeSchema = toNativeOutputSchema(zodSchemaToJsonSchema(schema))
+  return {
+    textFormat: {
+      type: 'json_schema',
+      structure: { jsonSchema: { schema: JSON.stringify(nativeSchema), name: STRUCTURED_OUTPUT_TOOL_NAME } },
+    },
+  }
+}
+
+/**
+ * Records a structured output rejection, so the request should be resent with the next mechanism.
+ *
+ * @returns True if the rejection was recorded; false if the error is unrelated and should surface unchanged
+ */
+function recordRejectedMechanism(
+  error: unknown,
+  mechanism: StructuredOutputMechanism,
+  modelId: string,
+  schema: z.ZodSchema
+): boolean {
+  if (!(error instanceof Error) || error.name !== 'ValidationException') return false
+  return handleRejectedMechanism('bedrock', modelId, mechanism, schema, error.message)
 }
 
 /**
